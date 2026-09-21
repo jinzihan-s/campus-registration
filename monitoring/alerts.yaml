@@ -1,0 +1,55 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: registration-alerts
+  namespace: registration
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: registration.rules
+      rules:
+        - alert: RegistrationServiceDown
+          expr: sum(up{namespace="registration", service="registration-api"}) < 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "报名服务没有可用监控目标"
+            description: "先检查 Pod 状态 探针 Service 和应用日志"
+ 
+        - alert: RegistrationHighErrorRate
+          expr: |
+            sum(rate(registration_http_requests_total{status=~"5.."}[5m]))
+            /
+            clamp_min(sum(rate(registration_http_requests_total[5m])), 0.001)
+            > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "报名服务五分钟错误率超过百分之五"
+
+        - alert: RegistrationHighP95Latency
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (
+                rate(registration_http_request_duration_seconds_bucket[5m])
+              )
+            ) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "报名服务 P95 响应时间超过一秒"
+
+        - alert: RegistrationPodRestarting
+          expr: |
+            increase(kube_pod_container_status_restarts_total{
+              namespace="registration", container="api"
+            }[10m]) > 3
+          labels:
+            severity: warning
+          annotations:
+            summary: "报名服务容器十分钟内重启超过三次"

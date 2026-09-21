@@ -1,0 +1,245 @@
+import os
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+ 
+import psycopg2
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
+from prometheus_client import Counter, Histogram, make_asgi_app
+from psycopg2.pool import ThreadedConnectionPool
+from pydantic import BaseModel, Field
+ 
+ 
+APP_NAME = os.getenv("APP_NAME", "campus-registration")
+APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+BASE_DIR = Path(__file__).resolve().parent
+ENABLE_TEST_ENDPOINTS = os.getenv("ENABLE_TEST_ENDPOINTS", "false").lower() == "true"
+SKIP_DB = os.getenv("SKIP_DB", "false").lower() == "true"
+ 
+pool = None
+ 
+HTTP_REQUESTS = Counter(
+    "registration_http_requests_total",
+    "HTTP request count",
+    ["method", "path", "status"],
+)
+HTTP_DURATION = Histogram(
+    "registration_http_request_duration_seconds",
+    "HTTP request duration in seconds",
+    ["method", "path"],
+)
+REGISTRATIONS = Counter(
+    "registration_attempts_total",
+    "Registration attempts",
+    ["result"],
+)
+ 
+ 
+def init_pool():
+    global pool
+    pool = ThreadedConnectionPool(
+        minconn=1,
+        maxconn=10,
+        host=os.environ["DB_HOST"],
+        port=int(os.getenv("DB_PORT", "5432")),
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        connect_timeout=3,
+    )
+ 
+ 
+def init_schema():
+    conn = pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS activities (
+                        id SERIAL PRIMARY KEY,
+                        name VARCHAR(100) NOT NULL,
+                        capacity INTEGER NOT NULL CHECK (capacity > 0),
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS registrations (
+                        id SERIAL PRIMARY KEY,
+                        activity_id INTEGER NOT NULL REFERENCES activities(id),
+                        student_id VARCHAR(40) NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE (activity_id, student_id)
+                    )
+                """)
+                cur.execute("SELECT COUNT(*) FROM activities")
+                if cur.fetchone()[0] == 0:
+                    cur.execute(
+                        "INSERT INTO activities(name, capacity) VALUES (%s, %s)",
+                        ("SRE 入门分享会", 500),
+                    )
+    finally:
+        pool.putconn(conn)
+ 
+ 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not SKIP_DB:
+        init_pool()
+        init_schema()
+    yield
+    if pool:
+        pool.closeall()
+ 
+ 
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+app.mount("/metrics", make_asgi_app())
+ 
+ 
+class RegistrationIn(BaseModel):
+    student_id: str = Field(min_length=3, max_length=40, pattern=r"^[A-Za-z0-9_-]+$")
+ 
+ 
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        path = getattr(route, "path", request.url.path)
+        HTTP_REQUESTS.labels(request.method, path, str(status)).inc()
+        HTTP_DURATION.labels(request.method, path).observe(time.perf_counter() - started)
+ 
+ 
+@app.get("/")
+def index():
+    return FileResponse(BASE_DIR / "static" / "index.html")
+ 
+ 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+ 
+ 
+@app.get("/ready")
+def ready():
+    if SKIP_DB:
+        return {"status": "ready", "database": "skipped"}
+    conn = None
+    try:
+        conn = pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        return {"status": "ready", "database": "ok"}
+    except Exception:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    finally:
+        if conn:
+            pool.putconn(conn)
+
+@app.get("/activities")
+def list_activities():
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT a.id, a.name, a.capacity, COUNT(r.id) AS registered
+                FROM activities a
+                LEFT JOIN registrations r ON r.activity_id = a.id
+                GROUP BY a.id
+                ORDER BY a.id
+            """)
+            rows = cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "name": row[1],
+                "capacity": row[2],
+                "registered": row[3],
+                "remaining": row[2] - row[3],
+            }
+            for row in rows
+        ]
+    finally:
+        pool.putconn(conn)
+ 
+ 
+@app.post("/activities/{activity_id}/register", status_code=201)
+def register(activity_id: int, body: RegistrationIn):
+    conn = pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT capacity FROM activities WHERE id=%s FOR UPDATE",
+                    (activity_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    REGISTRATIONS.labels("activity_not_found").inc()
+                    raise HTTPException(status_code=404, detail="activity not found")
+ 
+                cur.execute(
+                    "SELECT 1 FROM registrations WHERE activity_id=%s AND student_id=%s",
+                    (activity_id, body.student_id),
+                )
+                if cur.fetchone():
+                    REGISTRATIONS.labels("duplicate").inc()
+                    raise HTTPException(status_code=409, detail="already registered")
+ 
+                cur.execute(
+                    "SELECT COUNT(*) FROM registrations WHERE activity_id=%s",
+                    (activity_id,),
+                )
+                if cur.fetchone()[0] >= row[0]:
+                    REGISTRATIONS.labels("full").inc()
+                    raise HTTPException(status_code=409, detail="activity is full")
+ 
+                cur.execute(
+                    """INSERT INTO registrations(activity_id, student_id)
+                       VALUES (%s, %s) RETURNING id, created_at""",
+                    (activity_id, body.student_id),
+                )
+                registration_id, created_at = cur.fetchone()
+        REGISTRATIONS.labels("success").inc()
+        return {
+            "registration_id": registration_id,
+            "activity_id": activity_id,
+            "student_id": body.student_id,
+            "created_at": created_at,
+        }
+    finally:
+        pool.putconn(conn)
+ 
+ 
+def test_endpoint_guard():
+    if not ENABLE_TEST_ENDPOINTS:
+        raise HTTPException(status_code=404, detail="not found")
+ 
+ 
+@app.get("/test/slow")
+def slow(seconds: float = 2.0):
+    test_endpoint_guard()
+    time.sleep(min(max(seconds, 0), 10))
+    return {"slept_seconds": seconds}
+ 
+ 
+@app.get("/test/error")
+def error():
+    test_endpoint_guard()
+    return JSONResponse(status_code=500, content={"detail": "simulated error"})
+ 
+ 
+@app.get("/test/cpu")
+def cpu(seconds: float = 1.0):
+    test_endpoint_guard()
+    deadline = time.perf_counter() + min(max(seconds, 0), 5)
+    value = 0
+    while time.perf_counter() < deadline:
+        value = (value * 31 + 7) % 1000003
+    return {"status": "completed", "value": value}

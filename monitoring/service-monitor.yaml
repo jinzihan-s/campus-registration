@@ -1,0 +1,17 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: registration-api
+  namespace: registration
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: registration-api
+  namespaceSelector:
+    matchNames: ["registration"]
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
