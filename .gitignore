@@ -239,4 +239,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.13579abcde
+.13579abcde.pub
 >>>>>>> b524d617308e4739e0af35e36975cc36d5a428e4
